@@ -1,14 +1,15 @@
 ﻿import base64
 import json
+import shutil
 from pathlib import Path
 import gradio as gr
 from src.orchestration.engine import LucyEngine
-from src.orchestration.vision_gen import CHECKPOINT_MODELS, FOOOCUS_STYLES
+from src.orchestration.vision_gen import CHECKPOINT_MODELS, FOOOCUS_STYLES, RESOLUTIONS
+from src.orchestration.voice import list_saved_voices, VOICES_DIR, DEFAULT_REF_PHRASE
 
 CSS_PATH = Path("src/desktop/style.css")
 
 def _build_style_preview_map() -> str:
-    """Gera um mapa JSON com miniaturas base64 leves para hover instantâneo nos estilos."""
     preview_map = {}
     for name, info in FOOOCUS_STYLES.items():
         sample_path = info.get("sample")
@@ -91,6 +92,8 @@ def build_ui(engine: LucyEngine):
     }}
     """
 
+    initial_voices = list_saved_voices()
+
     with gr.Blocks(title="Lucy IA") as app:
         with gr.Row(elem_classes="lucy-header"):
             gr.HTML('<h1 class="lucy-title">✦ LUCY IA</h1>')
@@ -101,7 +104,7 @@ def build_ui(engine: LucyEngine):
 
         with gr.Row():
             with gr.Column(scale=7):
-                chatbot = gr.Chatbot(elem_classes="chatbot", height=550)
+                chatbot = gr.Chatbot(elem_classes="chatbot", height=580)
                 with gr.Row():
                     msg_input = gr.Textbox(
                         placeholder="Converse com a Lucy, peça para criar/ler arquivos ou gerar uma imagem...",
@@ -113,25 +116,77 @@ def build_ui(engine: LucyEngine):
 
             with gr.Column(scale=3):
                 audio_player = gr.Audio(label="Voz da Lucy", autoplay=True, interactive=False)
-                voice_clone_input = gr.Audio(
-                    label="Clonar Voz / Referência Anime (5-10s)",
-                    type="filepath"
-                )
-                with gr.Accordion("🎨 Configurações de Imagem (Fooocus)", open=True):
+                with gr.Accordion("🎙️ Biblioteca de Vozes (Chatterbox / F5-TTS)", open=True):
+                    with gr.Row():
+                        voice_library_dropdown = gr.Dropdown(
+                            choices=initial_voices,
+                            value=initial_voices[0] if initial_voices else None,
+                            label="Vozes Salvas (Data/voices)",
+                            scale=4
+                        )
+                        refresh_voices_btn = gr.Button("🔄", size="sm", scale=1)
+                    tts_backend_dropdown = gr.Dropdown(
+                        choices=["Chatterbox PT-BR (Expressivo)", "F5-TTS PT-BR (Rápido)"],
+                        value="Chatterbox PT-BR (Expressivo)",
+                        label="Motor de Voz"
+                    )
+                    exaggeration_slider = gr.Slider(
+                        minimum=0.2,
+                        maximum=1.0,
+                        value=0.65,
+                        step=0.05,
+                        label="Expressividade / Emoção Anime (Chatterbox)"
+                    )
+                    voice_clone_input = gr.Audio(
+                        label="Adicionar/Testar Novo Áudio (salva na biblioteca)",
+                        type="filepath"
+                    )
+                    ref_text_input = gr.Textbox(
+                        value=DEFAULT_REF_PHRASE,
+                        label="Frase de Referência (para F5-TTS)",
+                        lines=2
+                    )
+                with gr.Accordion("🎨 Configurações de Imagem (Fooocus)", open=False):
                     model_dropdown = gr.Dropdown(
                         choices=list(CHECKPOINT_MODELS.keys()),
                         value="Anime (AnimaPencil XL)",
                         label="Modelo Base (Checkpoint)"
                     )
+                    resolution_dropdown = gr.Dropdown(
+                        choices=list(RESOLUTIONS.keys()),
+                        value="1920x1080 (Full HD 16:9 - Paisagem)",
+                        label="Tamanho / Resolução"
+                    )
                     styles_dropdown = gr.Dropdown(
                         choices=list(FOOOCUS_STYLES.keys()),
                         value=["Fooocus Enhance", "Fooocus Sharp", "sai-anime"],
                         multiselect=True,
-                        label="Styles do Fooocus (Passe o mouse para ver o estilo)"
+                        label="Styles do Fooocus (Passe o mouse para ver)"
                     )
-                image_output = gr.Image(label="Visualizador / Imagem Gerada", height=290)
+                image_output = gr.Image(label="Visualizador / Imagem Gerada", height=250)
 
-        def handle_submit(user_msg, history, use_voice, custom_voice, selected_model, selected_styles):
+        def save_uploaded_voice(uploaded_path):
+            if not uploaded_path or not Path(uploaded_path).exists():
+                voices = list_saved_voices()
+                return gr.update(choices=voices)
+            src = Path(uploaded_path)
+            dest = VOICES_DIR / src.name
+            if src.resolve() != dest.resolve():
+                shutil.copy2(src, dest)
+            voices = list_saved_voices()
+            return gr.update(choices=voices, value=dest.name)
+
+        def refresh_voices():
+            voices = list_saved_voices()
+            return gr.update(choices=voices, value=voices[0] if voices else None)
+
+        voice_clone_input.change(save_uploaded_voice, inputs=[voice_clone_input], outputs=[voice_library_dropdown])
+        refresh_voices_btn.click(refresh_voices, outputs=[voice_library_dropdown])
+
+        def handle_submit(
+            user_msg, history, use_voice, lib_voice, custom_voice, ref_txt,
+            tts_backend, exag, selected_model, selected_styles, selected_res
+        ):
             if not user_msg.strip():
                 yield "", history, None, None, "**Status:** Pronto"
                 return
@@ -141,7 +196,8 @@ def build_ui(engine: LucyEngine):
             yield "", temp_history, None, None, "**Status:** Processando..."
 
             for reply_text, img_frame, audio_path, status_msg in engine.process_turn_stream(
-                user_msg, history, use_voice, custom_voice, selected_model, selected_styles
+                user_msg, history, use_voice, lib_voice, custom_voice, ref_txt,
+                tts_backend, exag, selected_model, selected_styles, selected_res
             ):
                 if reply_text is not None:
                     final_history = temp_history + [{"role": "assistant", "content": reply_text}]
@@ -151,16 +207,23 @@ def build_ui(engine: LucyEngine):
 
         send_btn.click(
             handle_submit,
-            inputs=[msg_input, chatbot, voice_toggle, voice_clone_input, model_dropdown, styles_dropdown],
+            inputs=[
+                msg_input, chatbot, voice_toggle, voice_library_dropdown, voice_clone_input,
+                ref_text_input, tts_backend_dropdown, exaggeration_slider,
+                model_dropdown, styles_dropdown, resolution_dropdown
+            ],
             outputs=[msg_input, chatbot, audio_player, image_output, status_badge]
         )
         msg_input.submit(
             handle_submit,
-            inputs=[msg_input, chatbot, voice_toggle, voice_clone_input, model_dropdown, styles_dropdown],
+            inputs=[
+                msg_input, chatbot, voice_toggle, voice_library_dropdown, voice_clone_input,
+                ref_text_input, tts_backend_dropdown, exaggeration_slider,
+                model_dropdown, styles_dropdown, resolution_dropdown
+            ],
             outputs=[msg_input, chatbot, audio_player, image_output, status_badge]
         )
         clear_btn.click(lambda: ([], None, None, "**Status:** Pronto"), outputs=[chatbot, audio_player, image_output, status_badge])
         app.load(None, None, None, js=hover_js)
 
     return app, custom_css
-

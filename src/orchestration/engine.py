@@ -5,7 +5,7 @@ import torch
 from llama_cpp import Llama
 from src.orchestration import tools
 from src.orchestration.vision_gen import ImageGenerator
-from src.orchestration.voice import VoiceEngine
+from src.orchestration.voice import VoiceEngine, DEFAULT_REF_PHRASE
 
 class LucyEngine:
     def __init__(self, model_path: str):
@@ -87,9 +87,14 @@ class LucyEngine:
         user_message: str,
         history: list,
         enable_voice: bool,
+        library_voice: str | None,
         custom_voice_path: str | None,
+        ref_text_hint: str = DEFAULT_REF_PHRASE,
+        tts_backend: str = "Chatterbox PT-BR (Expressivo)",
+        exaggeration: float = 0.65,
         image_model: str = "Anime (AnimaPencil XL)",
-        image_styles: list[str] | None = None
+        image_styles: list[str] | None = None,
+        image_resolution: str = "1920x1080 (Full HD 16:9 - Paisagem)"
     ):
         self._load_llm()
         messages = [{"role": "system", "content": self.system_prompt}]
@@ -124,12 +129,12 @@ class LucyEngine:
             elif fn_name == "open_file_in_os":
                 tool_result = tools.open_file_in_os(**args)
             elif fn_name == "generate_image":
-                # Libera TODOS os 8GB da 3070 Ti antes de gerar a imagem
                 self._unload_all_models()
                 for preview_frame, done_path, status_msg in self.image_gen.generate_stream(
                     args.get("prompt", user_message),
                     model_label=image_model,
-                    selected_styles=image_styles
+                    selected_styles=image_styles,
+                    resolution_label=image_resolution
                 ):
                     final_image_path = done_path
                     yield None, preview_frame, None, status_msg
@@ -150,6 +155,13 @@ class LucyEngine:
 
         audio_path = None
         if enable_voice and reply_text:
-            audio_path = self.voice_engine.synthesize(reply_text, custom_voice_path)
+            audio_path = self.voice_engine.synthesize(
+                reply_text,
+                selected_library_voice=library_voice,
+                uploaded_wav=custom_voice_path,
+                ref_text_hint=ref_text_hint,
+                tts_backend=tts_backend,
+                exaggeration=exaggeration
+            )
 
         yield reply_text, final_image_path, audio_path, "Pronto"
