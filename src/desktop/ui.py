@@ -100,19 +100,22 @@ def build_ui(engine: LucyEngine):
             with gr.Row():
                 status_badge = gr.Markdown("**Status:** Pronto")
                 voice_toggle = gr.Checkbox(label="Voz Ativa", value=True, scale=1)
+                screen_ocr_btn = gr.Button("👁️ Ler/Traduzir Tela", size="sm", scale=1)
                 clear_btn = gr.Button("Limpar Chat", size="sm", scale=1)
 
         with gr.Row():
             with gr.Column(scale=7):
-                chatbot = gr.Chatbot(elem_classes="chatbot", height=580)
+                chatbot = gr.Chatbot(elem_classes="chatbot", height=540)
                 with gr.Row():
                     msg_input = gr.Textbox(
-                        placeholder="Converse com a Lucy, peça para criar/ler arquivos ou gerar uma imagem...",
+                        placeholder="Converse com a Lucy, peça para abrir apps, criar arquivos no Desktop, traduzir tela ou gerar arte...",
                         show_label=False,
                         scale=8,
                         container=False
                     )
                     send_btn = gr.Button("Enviar", variant="primary", scale=2)
+                with gr.Accordion("👁️ Enviar Imagem/Print para a Lucy Ler ou Traduzir", open=False):
+                    vision_image_input = gr.Image(label="Arraste um print ou foto aqui", type="filepath", height=140)
 
             with gr.Column(scale=3):
                 audio_player = gr.Audio(label="Voz da Lucy", autoplay=True, interactive=False)
@@ -135,15 +138,15 @@ def build_ui(engine: LucyEngine):
                         maximum=1.0,
                         value=0.65,
                         step=0.05,
-                        label="Expressividade / Emoção Anime (Chatterbox)"
+                        label="Expressividade / Emoção Anime"
                     )
                     voice_clone_input = gr.Audio(
-                        label="Adicionar/Testar Novo Áudio (salva na biblioteca)",
+                        label="Adicionar/Testar Novo Áudio",
                         type="filepath"
                     )
                     ref_text_input = gr.Textbox(
                         value=DEFAULT_REF_PHRASE,
-                        label="Frase de Referência (para F5-TTS)",
+                        label="Frase de Referência (F5-TTS)",
                         lines=2
                     )
                 with gr.Accordion("🎨 Configurações de Imagem (Fooocus)", open=False):
@@ -157,13 +160,18 @@ def build_ui(engine: LucyEngine):
                         value="1920x1080 (Full HD 16:9 - Paisagem)",
                         label="Tamanho / Resolução"
                     )
+                    seed_input = gr.Number(
+                        value=-1,
+                        precision=0,
+                        label="Seed (-1 = Aleatória)"
+                    )
                     styles_dropdown = gr.Dropdown(
                         choices=list(FOOOCUS_STYLES.keys()),
                         value=["Fooocus Enhance", "Fooocus Sharp", "sai-anime"],
                         multiselect=True,
                         label="Styles do Fooocus (Passe o mouse para ver)"
                     )
-                image_output = gr.Image(label="Visualizador / Imagem Gerada", height=250)
+                image_output = gr.Image(label="Visualizador / Imagem Gerada", height=240)
 
         def save_uploaded_voice(uploaded_path):
             if not uploaded_path or not Path(uploaded_path).exists():
@@ -185,45 +193,52 @@ def build_ui(engine: LucyEngine):
 
         def handle_submit(
             user_msg, history, use_voice, lib_voice, custom_voice, ref_txt,
-            tts_backend, exag, selected_model, selected_styles, selected_res
+            tts_backend, exag, selected_model, selected_styles, selected_res, seed_val, up_img
         ):
-            if not user_msg.strip():
-                yield "", history, None, None, "**Status:** Pronto"
+            if not user_msg.strip() and not up_img:
+                yield "", history, None, None, "**Status:** Pronto", None
                 return
 
+            actual_msg = user_msg.strip() if user_msg.strip() else "Leia e traduza o texto desta imagem para mim."
             history = history or []
-            temp_history = history + [{"role": "user", "content": user_msg}]
-            yield "", temp_history, None, None, "**Status:** Processando..."
+            temp_history = history + [{"role": "user", "content": actual_msg}]
+            yield "", temp_history, None, None, "**Status:** Processando...", None
 
             for reply_text, img_frame, audio_path, status_msg in engine.process_turn_stream(
-                user_msg, history, use_voice, lib_voice, custom_voice, ref_txt,
-                tts_backend, exag, selected_model, selected_styles, selected_res
+                actual_msg, history, use_voice, lib_voice, custom_voice, ref_txt,
+                tts_backend, exag, selected_model, selected_styles, selected_res, seed_val, up_img
             ):
                 if reply_text is not None:
                     final_history = temp_history + [{"role": "assistant", "content": reply_text}]
-                    yield "", final_history, audio_path, img_frame, f"**Status:** {status_msg}"
+                    yield "", final_history, audio_path, img_frame, f"**Status:** {status_msg}", None
                 else:
-                    yield "", temp_history, None, img_frame, f"**Status:** {status_msg}"
+                    yield "", temp_history, None, img_frame, f"**Status:** {status_msg}", None
 
-        send_btn.click(
-            handle_submit,
-            inputs=[
-                msg_input, chatbot, voice_toggle, voice_library_dropdown, voice_clone_input,
-                ref_text_input, tts_backend_dropdown, exaggeration_slider,
-                model_dropdown, styles_dropdown, resolution_dropdown
-            ],
-            outputs=[msg_input, chatbot, audio_player, image_output, status_badge]
+        def handle_quick_screen_ocr(
+            history, use_voice, lib_voice, custom_voice, ref_txt,
+            tts_backend, exag, selected_model, selected_styles, selected_res, seed_val
+        ):
+            yield from handle_submit(
+                "Lucy, leia o que está na minha tela agora e traduza para o português!",
+                history, use_voice, lib_voice, custom_voice, ref_txt,
+                tts_backend, exag, selected_model, selected_styles, selected_res, seed_val, None
+            )
+
+        all_inputs = [
+            msg_input, chatbot, voice_toggle, voice_library_dropdown, voice_clone_input,
+            ref_text_input, tts_backend_dropdown, exaggeration_slider,
+            model_dropdown, styles_dropdown, resolution_dropdown, seed_input, vision_image_input
+        ]
+        all_outputs = [msg_input, chatbot, audio_player, image_output, status_badge, vision_image_input]
+
+        send_btn.click(handle_submit, inputs=all_inputs, outputs=all_outputs)
+        msg_input.submit(handle_submit, inputs=all_inputs, outputs=all_outputs)
+        screen_ocr_btn.click(
+            handle_quick_screen_ocr,
+            inputs=all_inputs[1:-1],
+            outputs=all_outputs
         )
-        msg_input.submit(
-            handle_submit,
-            inputs=[
-                msg_input, chatbot, voice_toggle, voice_library_dropdown, voice_clone_input,
-                ref_text_input, tts_backend_dropdown, exaggeration_slider,
-                model_dropdown, styles_dropdown, resolution_dropdown
-            ],
-            outputs=[msg_input, chatbot, audio_player, image_output, status_badge]
-        )
-        clear_btn.click(lambda: ([], None, None, "**Status:** Pronto"), outputs=[chatbot, audio_player, image_output, status_badge])
+        clear_btn.click(lambda: ([], None, None, "**Status:** Pronto", None), outputs=[chatbot, audio_player, image_output, status_badge, vision_image_input])
         app.load(None, None, None, js=hover_js)
 
     return app, custom_css

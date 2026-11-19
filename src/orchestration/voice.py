@@ -16,8 +16,16 @@ VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_REF_PHRASE = "Olá! Eu sou a Lucy, sua assistente pessoal. Estou pronta para ajudar você com tudo o que precisar hoje!"
 
+def cleanup_old_audio_files(keep_path: Path | None = None):
+    for f in OUTPUT_DIR.glob("voice_*.*"):
+        if keep_path and f.resolve() == keep_path.resolve():
+            continue
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 def list_saved_voices() -> list[str]:
-    """Lista todos os arquivos de voz salvos em Data/voices."""
     exts = {".wav", ".mp3", ".flac", ".ogg"}
     files = [
         f.name for f in sorted(VOICES_DIR.iterdir())
@@ -37,6 +45,23 @@ def _clean_text_for_speech(text: str) -> str:
     t = re.sub(r'R\$\s*(\d+)', r'\1 reais', t)
     t = re.sub(r'[^\w\s,.!?;:áéíóúâêîôûãõàçÁÉÍÓÚÂÊÎÔÛÃÕÀÇ-]', ' ', t)
     return re.sub(r'\s+', ' ', t).strip()
+
+def _chunk_sentences(text: str, max_chars: int = 180) -> list[str]:
+    parts = [p.strip() for p in re.split(r'(?<=[.!?])\s+', text) if len(p.strip()) > 1]
+    if not parts:
+        return [text]
+    chunks = []
+    current = ""
+    for p in parts:
+        if len(current) + len(p) + 1 <= max_chars:
+            current = f"{current} {p}".strip()
+        else:
+            if current:
+                chunks.append(current)
+            current = p
+    if current:
+        chunks.append(current)
+    return chunks
 
 def _prepare_reference_audio(src_path: str) -> str:
     wav, sr = torchaudio.load(src_path)
@@ -67,24 +92,47 @@ def _prepare_reference_audio(src_path: str) -> str:
 class VoiceEngine:
     def __init__(self):
         self.chatterbox_model = None
+        self.chatterbox_device = "cpu"
         self.f5_model = None
         self.default_edge_voice = "pt-BR-FranciscaNeural"
+        cleanup_old_audio_files()
 
-    def unload(self):
+    def _move_chatterbox(self, target_device: str):
+        """Move instantaneamente o Chatterbox entre RTX 3070 Ti (cuda) e os 32GB de RAM (cpu)."""
+        if self.chatterbox_model is None or self.chatterbox_device == target_device:
+            return
+        for attr in ("t3", "s3gen", "ve"):
+            sub = getattr(self.chatterbox_model, attr, None)
+            if sub is not None and hasattr(sub, "to"):
+                sub.to(target_device)
+        if hasattr(self.chatterbox_model, "device"):
+            self.chatterbox_model.device = target_device
+        self.chatterbox_device = target_device
+        if target_device == "cpu":
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def offload_to_ram(self):
+        """Libera a VRAM para o SDXL mantendo o modelo quente nos 32GB de RAM."""
         if self.chatterbox_model is not None:
-            del self.chatterbox_model
-            self.chatterbox_model = None
+            self._move_chatterbox("cpu")
         if self.f5_model is not None:
             del self.f5_model
             self.f5_model = None
-        gc.collect()
-        torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def unload(self):
+        self.offload_to_ram()
 
     def _load_chatterbox(self):
         if self.chatterbox_model is None:
             print("Carregando motor Chatterbox Multilingual PT-BR...")
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
             self.chatterbox_model = ChatterboxMultilingualTTS.from_pretrained(device="cuda")
+            self.chatterbox_device = "cuda"
+        elif self.chatterbox_device != "cuda":
+            self._move_chatterbox("cuda")
 
     def _load_f5(self):
         if self.f5_model is None:
@@ -141,14 +189,23 @@ class VoiceEngine:
                 prepared_ref = _prepare_reference_audio(ref_audio)
                 out_path = OUTPUT_DIR / f"voice_{uuid.uuid4().hex[:8]}.wav"
 
-                wav_out = self.chatterbox_model.generate(
-                    clean_text,
-                    language_id="pt",
-                    audio_prompt_path=prepared_ref,
-                    exaggeration=float(exaggeration),
-                    cfg_weight=0.5
-                )
-                torchaudio.save(str(out_path), wav_out.cpu(), self.chatterbox_model.sr)
+                chunks_text = _chunk_sentences(clean_text, max_chars=180)
+                wav_parts = []
+                silence = torch.zeros(1, int(self.chatterbox_model.sr * 0.14))
+                for part in chunks_text:
+                    wav_part = self.chatterbox_model.generate(
+                        part,
+                        language_id="pt",
+                        audio_prompt_path=prepared_ref,
+                        exaggeration=float(exaggeration),
+                        cfg_weight=0.5
+                    ).cpu()
+                    wav_parts.append(wav_part)
+                    wav_parts.append(silence)
+
+                full_wav = torch.cat(wav_parts, dim=1)
+                torchaudio.save(str(out_path), full_wav, self.chatterbox_model.sr)
+                cleanup_old_audio_files(keep_path=out_path)
                 torch.cuda.empty_cache()
                 return str(out_path)
             except Exception as e:
@@ -157,11 +214,7 @@ class VoiceEngine:
 
         if ref_audio:
             try:
-                if self.chatterbox_model is not None:
-                    del self.chatterbox_model
-                    self.chatterbox_model = None
-                    torch.cuda.empty_cache()
-
+                self.offload_to_ram()
                 self._load_f5()
                 prepared_ref = _prepare_reference_audio(ref_audio)
                 out_path = OUTPUT_DIR / f"voice_{uuid.uuid4().hex[:8]}.wav"
@@ -174,6 +227,7 @@ class VoiceEngine:
                     cfg_strength=2.0,
                     speed=0.95
                 )
+                cleanup_old_audio_files(keep_path=out_path)
                 torch.cuda.empty_cache()
                 return str(out_path)
             except Exception as e:
@@ -183,6 +237,7 @@ class VoiceEngine:
         try:
             out_path = OUTPUT_DIR / f"voice_{uuid.uuid4().hex[:8]}.mp3"
             asyncio.run(self._synthesize_edge(clean_text, out_path))
+            cleanup_old_audio_files(keep_path=out_path)
             return str(out_path)
         except Exception as e:
             print(f"[AVISO EDGE-TTS]: Falha na sintese ({e}).")

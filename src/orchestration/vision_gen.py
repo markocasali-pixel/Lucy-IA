@@ -1,11 +1,13 @@
 ﻿import gc
 import json
 import queue
+import random
 import threading
 import uuid
 from pathlib import Path
 from PIL import Image, ImageEnhance
 import torch
+from compel import CompelForSDXL
 from diffusers import (
     StableDiffusionXLPipeline,
     DPMSolverMultistepScheduler,
@@ -28,7 +30,6 @@ CHECKPOINT_MODELS = {
     "Artístico (Playground v2.5)": "playground-v2.5-1024px-aesthetic.fp16.safetensors",
 }
 
-# Mapeia (largura_nativa_sdxl, altura_nativa_sdxl, largura_final, altura_final)
 RESOLUTIONS = {
     "1920x1080 (Full HD 16:9 - Paisagem)": (1024, 576, 1920, 1080),
     "1080x1920 (Full HD 9:16 - Retrato)": (576, 1024, 1080, 1920),
@@ -135,19 +136,35 @@ class ImageGenerator:
         prompt: str,
         model_label: str = "Anime (AnimaPencil XL)",
         selected_styles: list[str] | None = None,
-        resolution_label: str = "1920x1080 (Full HD 16:9 - Paisagem)"
+        resolution_label: str = "1920x1080 (Full HD 16:9 - Paisagem)",
+        seed: int = -1
     ):
         self._load_pipeline(model_label)
         gen_w, gen_h, target_w, target_h = RESOLUTIONS.get(
             resolution_label, (1024, 576, 1920, 1080)
         )
 
+        used_seed = int(seed) if (seed is not None and int(seed) >= 0) else random.randint(1, 2147483647)
+        generator = torch.Generator(device="cpu").manual_seed(used_seed)
+
         full_prompt, neg_prompt = apply_fooocus_styles(prompt, selected_styles)
         if "Pony" in model_label:
             full_prompt = f"score_9, score_8_up, score_7_up, source_anime, {full_prompt}"
 
+        compel = CompelForSDXL(self.pipe, device="cuda")
+        with torch.no_grad():
+            prompt_embeds = compel(full_prompt, negative_prompt=neg_prompt)
+            conditioning = prompt_embeds.embeds.to("cuda", dtype=torch.float16)
+            pooled = prompt_embeds.pooled_embeds.to("cuda", dtype=torch.float16)
+            neg_conditioning = prompt_embeds.negative_embeds.to("cuda", dtype=torch.float16)
+            neg_pooled = prompt_embeds.negative_pooled_embeds.to("cuda", dtype=torch.float16)
+
+        del compel, prompt_embeds
+        gc.collect()
+        torch.cuda.empty_cache()
+
         preview_queue = queue.Queue()
-        final_holder = {"path": None, "done": False}
+        final_holder = {"path": None, "done": False, "error": None}
 
         def step_callback(pipe, step_index, timestep, callback_kwargs):
             if step_index % 2 == 0:
@@ -160,25 +177,31 @@ class ImageGenerator:
             return callback_kwargs
 
         def run_inference():
-            image = self.pipe(
-                prompt=full_prompt,
-                negative_prompt=neg_prompt,
-                width=gen_w,
-                height=gen_h,
-                num_inference_steps=18,
-                guidance_scale=6.5,
-                callback_on_step_end=step_callback
-            ).images[0]
+            try:
+                image = self.pipe(
+                    prompt_embeds=conditioning,
+                    pooled_prompt_embeds=pooled,
+                    negative_prompt_embeds=neg_conditioning,
+                    negative_pooled_prompt_embeds=neg_pooled,
+                    width=gen_w,
+                    height=gen_h,
+                    num_inference_steps=18,
+                    guidance_scale=6.5,
+                    generator=generator,
+                    callback_on_step_end=step_callback
+                ).images[0]
 
-            # Se o alvo for Full HD (1920x1080 ou 1080x1920), faz upscale Lanczos + leve nitidez
-            if (image.width, image.height) != (target_w, target_h):
-                image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                image = ImageEnhance.Sharpness(image).enhance(1.12)
+                if (image.width, image.height) != (target_w, target_h):
+                    image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                    image = ImageEnhance.Sharpness(image).enhance(1.12)
 
-            file_path = OUTPUT_DIR / f"img_{uuid.uuid4().hex[:8]}.png"
-            image.save(file_path)
-            final_holder["path"] = str(file_path)
-            final_holder["done"] = True
+                file_path = OUTPUT_DIR / f"img_{used_seed}_{uuid.uuid4().hex[:6]}.png"
+                image.save(file_path)
+                final_holder["path"] = str(file_path)
+            except Exception as e:
+                final_holder["error"] = str(e)
+            finally:
+                final_holder["done"] = True
 
         worker = threading.Thread(target=run_inference)
         worker.start()
@@ -186,16 +209,18 @@ class ImageGenerator:
         while not final_holder["done"] or not preview_queue.empty():
             try:
                 step_num, frame = preview_queue.get(timeout=0.15)
-                yield frame, None, f"Gerando {target_w}x{target_h}... Passo {step_num}/18"
+                yield frame, None, f"Gerando {target_w}x{target_h} (Seed {used_seed})... Passo {step_num}/18"
             except queue.Empty:
                 continue
 
         worker.join()
 
-        del self.pipe
+        del self.pipe, conditioning, pooled, neg_conditioning, neg_pooled
         self.pipe = None
         gc.collect()
         torch.cuda.empty_cache()
 
-        yield final_holder["path"], final_holder["path"], f"Concluído ({target_w}x{target_h})!"
-
+        if final_holder["error"]:
+            yield None, None, f"Erro na imagem: {final_holder['error']}"
+        else:
+            yield final_holder["path"], final_holder["path"], f"Concluído ({target_w}x{target_h} | Seed: {used_seed})"
