@@ -98,7 +98,6 @@ class VoiceEngine:
         cleanup_old_audio_files()
 
     def _move_chatterbox(self, target_device: str):
-        """Move instantaneamente o Chatterbox entre RTX 3070 Ti (cuda) e os 32GB de RAM (cpu)."""
         if self.chatterbox_model is None or self.chatterbox_device == target_device:
             return
         for attr in ("t3", "s3gen", "ve"):
@@ -113,7 +112,6 @@ class VoiceEngine:
             torch.cuda.empty_cache()
 
     def offload_to_ram(self):
-        """Libera a VRAM para o SDXL mantendo o modelo quente nos 32GB de RAM."""
         if self.chatterbox_model is not None:
             self._move_chatterbox("cpu")
         if self.f5_model is not None:

@@ -1,5 +1,11 @@
-﻿import os
+﻿import json
+import os
+import re
 import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
 import webbrowser
 from pathlib import Path
 import mss
@@ -13,6 +19,15 @@ OUTPUT_DIR = Path("Data/outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 _ocr_engine = None
+_SEARCH_CACHE: dict[str, tuple[float, str]] = {}
+_CACHE_TTL_SEC = 120.0
+
+_STOPWORDS_PT = {
+    "qual", "quais", "que", "o", "a", "os", "as", "um", "uma", "de", "do", "da",
+    "dos", "das", "em", "no", "na", "nos", "nas", "por", "para", "com", "sem",
+    "sobre", "hoje", "atual", "atuais", "mais", "recentes", "novidades", "noticias",
+    "notícias", "valor", "preco", "preço", "cotacao", "cotação", "quanto", "esta", "está"
+}
 
 def _get_ocr():
     global _ocr_engine
@@ -40,17 +55,165 @@ def _resolve_target_path(filename: str, location: str = "workspace") -> Path:
         return _get_desktop_dir() / clean_name
     return WORKSPACE_DIR / p.name
 
-def web_search(query: str) -> str:
+def _is_clean_pt_text(text: str) -> bool:
+    if not text or len(text.strip()) < 8:
+        return False
+    if re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u0400-\u04ff\u0600-\u06ff]', text):
+        return False
+    return True
+
+def _is_relevant_to_query(line: str, query: str) -> bool:
+    q_low = (query or "").lower()
+    l_low = (line or "").lower()
+    words = [w for w in re.findall(r"[a-zà-ú0-9]{2,}", q_low) if w not in _STOPWORDS_PT]
+    if not words:
+        return True
+    # Expansão natural de termos chave (ex.: "ia" <-> "inteligência artificial")
+    expanded = set(words)
+    if "ia" in expanded or "inteligencia" in expanded or "inteligência" in expanded or "artificial" in expanded:
+        expanded.update({"ia", "inteligência", "inteligencia", "artificial", "modelo", "modelos", "llm"})
+    return any(w in l_low for w in expanded)
+
+def _http_get_json(url: str, timeout_sec: float = 2.5) -> dict | list | None:
     try:
-        from ddgs import DDGS
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, region="br-pt", max_results=4))
-        if not results:
-            return "Nenhum resultado encontrado na busca."
-        snippets = [f"- {r.get('title')}: {r.get('body')}" for r in results]
-        return "\n".join(snippets)
-    except Exception as e:
-        return f"Erro na pesquisa web: {e}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LucyIA/1.0",
+                "Accept": "application/json"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(raw)
+    except Exception:
+        return None
+
+def _search_currency_if_applicable(q_low: str) -> str | None:
+    pairs = [
+        (("dolar", "dólar", "usd"), "USD-BRL", "Dólar (USD/BRL)"),
+        (("euro", "eur"), "EUR-BRL", "Euro (EUR/BRL)"),
+        (("bitcoin", "btc"), "BTC-BRL", "Bitcoin (BTC/BRL)"),
+    ]
+    for keys, pair, label in pairs:
+        if any(k in q_low for k in keys) and any(w in q_low for w in ("preco", "preço", "valor", "cotacao", "cotação", "quanto esta", "quanto está", "hoje", "atual")):
+            data = _http_get_json(f"https://economia.awesomeapi.com.br/json/last/{pair}", timeout_sec=2.5)
+            key = pair.replace("-", "")
+            if isinstance(data, dict) and key in data and isinstance(data[key], dict):
+                bid = data[key].get("bid")
+                if bid:
+                    return f"{label} agora: R$ {float(bid):.2f}"
+    return None
+
+def _search_ddg_instant(query: str, timeout_sec: float = 2.5) -> list[str]:
+    q_enc = urllib.parse.quote_plus(query)
+    data = _http_get_json(f"https://api.duckduckgo.com/?q={q_enc}&format=json&no_html=1&skip_disambig=1", timeout_sec=timeout_sec)
+    out = []
+    if isinstance(data, dict):
+        if data.get("AbstractText") and _is_clean_pt_text(str(data["AbstractText"])):
+            out.append(str(data["AbstractText"]).strip())
+        for topic in (data.get("RelatedTopics") or [])[:4]:
+            if isinstance(topic, dict) and topic.get("Text") and _is_clean_pt_text(str(topic["Text"])):
+                out.append(str(topic["Text"]).strip())
+    return out
+
+def _search_wikipedia_pt(query: str, timeout_sec: float = 2.5) -> list[str]:
+    q_enc = urllib.parse.quote_plus(query)
+    data = _http_get_json(
+        f"https://pt.wikipedia.org/w/api.php?action=query&list=search&srsearch={q_enc}&utf8=&format=json&srlimit=2",
+        timeout_sec=timeout_sec
+    )
+    out = []
+    if isinstance(data, dict):
+        items = ((data.get("query") or {}).get("search")) or []
+        for it in items[:2]:
+            title = it.get("title", "")
+            snippet = it.get("snippet", "")
+            clean_snip = re.sub(r'<[^>]+>', '', snippet)
+            clean_snip = clean_snip.replace("&quot;", '"').replace("&#039;", "'")
+            combined = f"{title}: {clean_snip}".strip(": ")
+            if _is_clean_pt_text(combined):
+                out.append(combined)
+    return out
+
+def _search_ddgs_library(query: str, timeout_sec: float = 3.0) -> list[str]:
+    box = {"items": []}
+
+    def _run():
+        try:
+            from ddgs import DDGS
+            with DDGS(timeout=max(2, int(timeout_sec))) as ddgs:
+                results = list(ddgs.text(query, region="br-pt", max_results=4))
+            for r in results:
+                title = (r.get("title") or "").strip()
+                body = (r.get("body") or "").strip()
+                combined = f"{title}: {body}".strip(": ")
+                if _is_clean_pt_text(combined):
+                    box["items"].append(combined)
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(timeout=timeout_sec)
+    return box["items"]
+
+def web_search(query: str, timeout_sec: float = 3.5) -> str:
+    clean_q = (query or "").strip()
+    if not clean_q:
+        return "Consulta vazia."
+
+    now = time.time()
+    cache_key = clean_q.lower()
+    if cache_key in _SEARCH_CACHE:
+        ts, cached_val = _SEARCH_CACHE[cache_key]
+        if now - ts < _CACHE_TTL_SEC:
+            return cached_val
+
+    q_low = clean_q.lower()
+    currency = _search_currency_if_applicable(q_low)
+    if currency:
+        _SEARCH_CACHE[cache_key] = (now, currency)
+        return currency
+
+    effective_q = clean_q
+    if any(k in q_low for k in ("valor", "preco", "preço", "fipe", "carro", "veiculo", "veículo")) and "brasil" not in q_low and "fipe" not in q_low:
+        effective_q = f"{clean_q} tabela fipe valor reais"
+
+    collected: list[str] = []
+
+    def _run_instant():
+        collected.extend(_search_ddg_instant(effective_q, timeout_sec=2.2))
+
+    def _run_wiki():
+        collected.extend(_search_wikipedia_pt(clean_q, timeout_sec=2.2))
+
+    def _run_ddgs():
+        collected.extend(_search_ddgs_library(effective_q, timeout_sec=min(3.0, timeout_sec)))
+
+    threads = [
+        threading.Thread(target=_run_instant, daemon=True),
+        threading.Thread(target=_run_wiki, daemon=True),
+        threading.Thread(target=_run_ddgs, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout_sec)
+
+    unique_lines = []
+    seen = set()
+    for line in collected:
+        if not _is_relevant_to_query(line, clean_q):
+            continue
+        norm = line.lower()
+        if norm not in seen:
+            seen.add(norm)
+            unique_lines.append(f"- {line[:260]}")
+
+    result_text = "\n".join(unique_lines[:4]) if unique_lines else "Não foi possível obter resultados confiáveis e relevantes agora."
+    _SEARCH_CACHE[cache_key] = (now, result_text)
+    return result_text
 
 def list_files(location: str = "workspace") -> str:
     target_dir = _get_desktop_dir() if "desktop" in (location or "").lower() else WORKSPACE_DIR
@@ -108,7 +271,6 @@ def open_file_in_os(filename: str, location: str = "workspace") -> str:
         return f"Erro ao abrir arquivo: {e}"
 
 def open_app(app_name: str) -> str:
-    """Abre aplicativos do Windows ou URLs pelo nome."""
     name = (app_name or "").strip().lower()
     app_map = {
         "calculadora": "calc.exe",
@@ -148,11 +310,10 @@ def open_app(app_name: str) -> str:
         return f"ERRO ao abrir '{app_name}': {e}"
 
 def system_control(action: str) -> str:
-    """Controla volume, mídia ou retorna status do PC/GPU."""
     act = (action or "").lower()
     try:
         if any(k in act for k in ("status", "gpu", "cpu", "ram", "sistema", "temperatura")):
-            cpu_pct = psutil.cpu_percent(interval=0.3)
+            cpu_pct = psutil.cpu_percent(interval=0.2)
             ram = psutil.virtual_memory()
             gpu_info = "CUDA indisponível"
             if torch.cuda.is_available():
@@ -166,7 +327,6 @@ def system_control(action: str) -> str:
         VK_VOLUME_DOWN = 0xAE
         VK_VOLUME_UP = 0xAF
         VK_MEDIA_NEXT = 0xB0
-        VK_MEDIA_PREV = 0xB1
         VK_MEDIA_PLAY_PAUSE = 0xB3
 
         def _press_key(vk, times=1):
@@ -194,7 +354,6 @@ def system_control(action: str) -> str:
         return f"ERRO no controle do sistema: {e}"
 
 def read_screen_or_image(image_path: str | None = None) -> str:
-    """Captura a tela atual (incluindo jogos) ou lê uma imagem enviada e extrai todo o texto via OCR."""
     try:
         target_img = image_path
         if not target_img or not Path(target_img).exists():

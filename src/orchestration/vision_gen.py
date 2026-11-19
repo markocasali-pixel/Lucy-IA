@@ -15,7 +15,7 @@ from diffusers import (
     AutoencoderTiny
 )
 
-OUTPUT_DIR = Path("Data/outputs")
+OUTPUT_DIR = Path("Data/outputs").resolve()
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 FOOOCUS_BASE = Path(r"D:\Fooocus_win64_2-5-0\Fooocus")
@@ -69,7 +69,10 @@ def load_fooocus_styles() -> dict[str, dict]:
 FOOOCUS_STYLES = load_fooocus_styles()
 
 def apply_fooocus_styles(base_prompt: str, selected_styles: list[str] | None) -> tuple[str, str]:
-    prompt = base_prompt.strip()
+    prompt = (
+        f"{base_prompt.strip()}, masterpiece, best quality, highly detailed face, "
+        "symmetrical eyes, sharp facial features, clean lineart, rich lighting"
+    )
     neg_parts = []
 
     for style_name in reversed(selected_styles or []):
@@ -91,11 +94,15 @@ def apply_fooocus_styles(base_prompt: str, selected_styles: list[str] | None) ->
         if p and p.lower() not in seen:
             seen.add(p.lower())
             clean_tokens.append(p)
-    final_prompt = ", ".join(clean_tokens)
+    final_prompt = ", ".join(clean_tokens[:28])
 
+    neg_parts.append(
+        "bad face, distorted face, ugly face, deformed face, asymmetric eyes, cross-eyed, "
+        "bad anatomy, bad hands, extra fingers, missing fingers, extra limbs, missing limbs, "
+        "text, watermark, signature, error, worst quality, low quality, blurry, deformed, "
+        "camera viewfinder, tv screen, monitor, phone screen, framed by screen, hands holding camera"
+    )
     neg_prompt = ", ".join(dict.fromkeys(p.strip() for p in neg_parts if p.strip()))
-    if not neg_prompt:
-        neg_prompt = "lowres, bad anatomy, bad hands, text, error, worst quality, low quality, blurry, deformed"
     return final_prompt, neg_prompt
 
 class ImageGenerator:
@@ -139,7 +146,12 @@ class ImageGenerator:
         resolution_label: str = "1920x1080 (Full HD 16:9 - Paisagem)",
         seed: int = -1
     ):
-        self._load_pipeline(model_label)
+        try:
+            self._load_pipeline(model_label)
+        except Exception as e:
+            yield None, None, f"Erro ao carregar modelo '{model_label}': {e}"
+            return
+
         gen_w, gen_h, target_w, target_h = RESOLUTIONS.get(
             resolution_label, (1024, 576, 1920, 1080)
         )
@@ -165,9 +177,10 @@ class ImageGenerator:
 
         preview_queue = queue.Queue()
         final_holder = {"path": None, "done": False, "error": None}
+        total_steps = 30
 
         def step_callback(pipe, step_index, timestep, callback_kwargs):
-            if step_index % 2 == 0:
+            if step_index % 3 == 0:
                 latents = callback_kwargs["latents"]
                 with torch.no_grad():
                     decoded = self.taesd.decode(latents).sample
@@ -185,18 +198,19 @@ class ImageGenerator:
                     negative_pooled_prompt_embeds=neg_pooled,
                     width=gen_w,
                     height=gen_h,
-                    num_inference_steps=18,
-                    guidance_scale=6.5,
+                    num_inference_steps=total_steps,
+                    guidance_scale=7.0,
                     generator=generator,
                     callback_on_step_end=step_callback
                 ).images[0]
 
                 if (image.width, image.height) != (target_w, target_h):
                     image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                    image = ImageEnhance.Sharpness(image).enhance(1.12)
+                    image = ImageEnhance.Sharpness(image).enhance(1.15)
+                    image = ImageEnhance.Contrast(image).enhance(1.04)
 
                 file_path = OUTPUT_DIR / f"img_{used_seed}_{uuid.uuid4().hex[:6]}.png"
-                image.save(file_path)
+                image.save(file_path, format="PNG")
                 final_holder["path"] = str(file_path)
             except Exception as e:
                 final_holder["error"] = str(e)
@@ -209,7 +223,7 @@ class ImageGenerator:
         while not final_holder["done"] or not preview_queue.empty():
             try:
                 step_num, frame = preview_queue.get(timeout=0.15)
-                yield frame, None, f"Gerando {target_w}x{target_h} (Seed {used_seed})... Passo {step_num}/18"
+                yield frame, None, f"Gerando em alta qualidade ({target_w}x{target_h}, Seed {used_seed})... Passo {step_num}/{total_steps}"
             except queue.Empty:
                 continue
 
@@ -222,5 +236,7 @@ class ImageGenerator:
 
         if final_holder["error"]:
             yield None, None, f"Erro na imagem: {final_holder['error']}"
+        elif final_holder["path"] and Path(final_holder["path"]).exists():
+            yield final_holder["path"], final_holder["path"], f"Concluído em alta qualidade ({target_w}x{target_h} | Seed: {used_seed})"
         else:
-            yield final_holder["path"], final_holder["path"], f"Concluído ({target_w}x{target_h} | Seed: {used_seed})"
+            yield None, None, "Falha ao salvar a imagem final."
