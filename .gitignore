@@ -1,0 +1,13 @@
+﻿venv/
+__pycache__/
+*.pyc
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.bin
+Data/outputs/*
+Data/backups/*
+Data/workspace/*
+!Data/outputs/.gitkeep
+!Data/workspace/.gitkeep

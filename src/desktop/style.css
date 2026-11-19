@@ -1,0 +1,52 @@
+﻿.gradio-container {
+    background: radial-gradient(circle at 15% 20%, #1a0b2e 0%, #090a16 45%, #05050a 100%) !important;
+    color: #e2e8f0 !important;
+    font-family: 'Segoe UI', Inter, system-ui, sans-serif !important;
+}
+
+.lucy-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 20px;
+    background: rgba(15, 23, 42, 0.65);
+    border: 1px solid rgba(236, 72, 153, 0.3);
+    border-radius: 12px;
+    backdrop-filter: blur(10px);
+    margin-bottom: 12px;
+}
+
+.lucy-title {
+    font-size: 1.45rem;
+    font-weight: 700;
+    background: linear-gradient(90deg, #38bdf8, #a855f7, #ec4899);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin: 0;
+}
+
+.chatbot .message.user {
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(168, 85, 247, 0.18)) !important;
+    border: 1px solid rgba(56, 189, 248, 0.35) !important;
+    border-radius: 16px 16px 4px 16px !important;
+}
+
+.chatbot .message.bot {
+    background: rgba(15, 23, 42, 0.85) !important;
+    border: 1px solid rgba(236, 72, 153, 0.35) !important;
+    border-radius: 16px 16px 16px 4px !important;
+}
+
+button.primary {
+    background: linear-gradient(90deg, #2563eb, #9333ea, #db2777) !important;
+    border: none !important;
+    color: white !important;
+    font-weight: 600 !important;
+    border-radius: 8px !important;
+    transition: transform 0.15s ease, box-shadow 0.15s ease !important;
+}
+
+button.primary:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 0 18px rgba(219, 39, 119, 0.5) !important;
+}
