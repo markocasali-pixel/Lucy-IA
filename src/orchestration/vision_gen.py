@@ -5,7 +5,6 @@ import random
 import threading
 import uuid
 from pathlib import Path
-from PIL import Image, ImageEnhance
 import torch
 from compel import CompelForSDXL
 from diffusers import (
@@ -31,10 +30,10 @@ CHECKPOINT_MODELS = {
 }
 
 RESOLUTIONS = {
-    "1920x1080 (Full HD 16:9 - Paisagem)": (1024, 576, 1920, 1080),
-    "1080x1920 (Full HD 9:16 - Retrato)": (576, 1024, 1080, 1920),
+    "1920x1080 (Full HD 16:9 - Paisagem)": (1344, 768, 1344, 768),
+    "1080x1920 (Full HD 9:16 - Retrato)": (768, 1344, 768, 1344),
     "1024x1024 (Quadrado 1:1)": (1024, 1024, 1024, 1024),
-    "832x1024 (Retrato Clássico)": (832, 1024, 832, 1024),
+    "832x1024 (Retrato Clássico)": (832, 1216, 832, 1216),
 }
 
 def _style_to_sample_path(style_name: str) -> str | None:
@@ -69,10 +68,7 @@ def load_fooocus_styles() -> dict[str, dict]:
 FOOOCUS_STYLES = load_fooocus_styles()
 
 def apply_fooocus_styles(base_prompt: str, selected_styles: list[str] | None) -> tuple[str, str]:
-    prompt = (
-        f"{base_prompt.strip()}, masterpiece, best quality, highly detailed face, "
-        "symmetrical eyes, sharp facial features, clean lineart, rich lighting"
-    )
+    prompt = f"{base_prompt.strip()}, high quality, clear details, well-defined eyes"
     neg_parts = []
 
     for style_name in reversed(selected_styles or []):
@@ -94,12 +90,13 @@ def apply_fooocus_styles(base_prompt: str, selected_styles: list[str] | None) ->
         if p and p.lower() not in seen:
             seen.add(p.lower())
             clean_tokens.append(p)
-    final_prompt = ", ".join(clean_tokens[:28])
+    final_prompt = ", ".join(clean_tokens)
 
     neg_parts.append(
+        "vignette, round frame, circular border, lens frame, close-up face zoom, cropped wings, cropped head, "
         "bad face, distorted face, ugly face, deformed face, asymmetric eyes, cross-eyed, "
         "bad anatomy, bad hands, extra fingers, missing fingers, extra limbs, missing limbs, "
-        "text, watermark, signature, error, worst quality, low quality, blurry, deformed, "
+        "text, watermark, signature, error, worst quality, low quality, blurry, "
         "camera viewfinder, tv screen, monitor, phone screen, framed by screen, hands holding camera"
     )
     neg_prompt = ", ".join(dict.fromkeys(p.strip() for p in neg_parts if p.strip()))
@@ -153,7 +150,7 @@ class ImageGenerator:
             return
 
         gen_w, gen_h, target_w, target_h = RESOLUTIONS.get(
-            resolution_label, (1024, 576, 1920, 1080)
+            resolution_label, (1344, 768, 1344, 768)
         )
 
         used_seed = int(seed) if (seed is not None and int(seed) >= 0) else random.randint(1, 2147483647)
@@ -177,10 +174,10 @@ class ImageGenerator:
 
         preview_queue = queue.Queue()
         final_holder = {"path": None, "done": False, "error": None}
-        total_steps = 30
+        total_steps = 32
 
         def step_callback(pipe, step_index, timestep, callback_kwargs):
-            if step_index % 3 == 0:
+            if step_index % 4 == 0:
                 latents = callback_kwargs["latents"]
                 with torch.no_grad():
                     decoded = self.taesd.decode(latents).sample
@@ -204,11 +201,6 @@ class ImageGenerator:
                     callback_on_step_end=step_callback
                 ).images[0]
 
-                if (image.width, image.height) != (target_w, target_h):
-                    image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                    image = ImageEnhance.Sharpness(image).enhance(1.15)
-                    image = ImageEnhance.Contrast(image).enhance(1.04)
-
                 file_path = OUTPUT_DIR / f"img_{used_seed}_{uuid.uuid4().hex[:6]}.png"
                 image.save(file_path, format="PNG")
                 final_holder["path"] = str(file_path)
@@ -223,7 +215,7 @@ class ImageGenerator:
         while not final_holder["done"] or not preview_queue.empty():
             try:
                 step_num, frame = preview_queue.get(timeout=0.15)
-                yield frame, None, f"Gerando em alta qualidade ({target_w}x{target_h}, Seed {used_seed})... Passo {step_num}/{total_steps}"
+                yield frame, None, f"Renderizando nativa {gen_w}x{gen_h} (Seed {used_seed})... Passo {step_num}/{total_steps}"
             except queue.Empty:
                 continue
 
@@ -237,6 +229,8 @@ class ImageGenerator:
         if final_holder["error"]:
             yield None, None, f"Erro na imagem: {final_holder['error']}"
         elif final_holder["path"] and Path(final_holder["path"]).exists():
-            yield final_holder["path"], final_holder["path"], f"Concluído em alta qualidade ({target_w}x{target_h} | Seed: {used_seed})"
+            yield final_holder["path"], final_holder["path"], f"Concluído nativa ({gen_w}x{gen_h} | Seed: {used_seed})"
         else:
             yield None, None, "Falha ao salvar a imagem final."
+
+

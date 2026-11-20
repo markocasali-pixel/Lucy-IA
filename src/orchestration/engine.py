@@ -24,25 +24,27 @@ _PT_TO_EN_IMAGE_MAP = [
     (r"\bguerreiro\b", "male warrior"),
     (r"\bvampira\b", "female vampire"),
     (r"\bvampiro\b", "male vampire"),
-    (r"\bmenina\b|\bgarota\b", "anime girl"),
+    (r"\bgótica\b|\bgotico\b|\bgótico\b", "gothic"),
+    (r"\bsob luar\b|\bluar\b|\blua cheia\b|\blua\b", "moonlight, glowing moon in dark sky"),
+    (r"\bmenina\b|\bgarota\b", "girl"),
     (r"\bmenino\b|\bgaroto\b", "anime boy"),
     (r"\bmulher\b", "woman"),
     (r"\bhomem\b", "man"),
-    (r"\bgato\b", "cat"),
+    (r"\bgatinho\b|\bgato\b", "cute cat"),
     (r"\bcachorro\b", "dog"),
     (r"\bdragao\b|\bdragão\b", "dragon"),
-    (r"\bcidade chuvosa\b", "rainy city"),
-    (r"\bchuva\b|\bchuvosa\b", "rain, wet reflections"),
-    (r"\bà noite\b|\ba noite\b|\bnoite\b", "at night"),
-    (r"\biluminação neon\b|\biluminacao neon\b|\bneon\b", "neon lighting, glowing neon"),
+    (r"\bcidade chuvosa\b", "rainy cyberpunk city street"),
+    (r"\bchuva\b|\bchuvosa\b", "rain, wet pavement reflections"),
+    (r"\bà noite\b|\ba noite\b|\bnoite\b", "at night, dark night sky"),
+    (r"\biluminação neon\b|\biluminacao neon\b|\bneon\b", "neon lights, colorful neon glow"),
     (r"\bciberpunk\b|\bcyberpunk\b", "cyberpunk"),
     (r"\bfuturista\b", "futuristic"),
     (r"\barmadura\b", "armor"),
     (r"\bespada\b", "sword"),
-    (r"\basas\b", "wings"),
-    (r"\bfloresta\b", "forest"),
-    (r"\bcastelo\b", "castle"),
-    (r"\bcyber\b", "cyber"),
+    (r"\basas\b", "large wings"),
+    (r"\bfloresta\b", "dark forest"),
+    (r"\bcastelo\b", "gothic castle"),
+    (r"\bestilo anime detalhado\b|\bestilo anime\b|\banime\b", "anime art style, detailed illustration"),
 ]
 
 def _sanitize_output(text: str) -> str:
@@ -163,24 +165,29 @@ class LucyEngine:
 
     def _prepare_english_image_prompt(self, raw_prompt: str, fallback_user_msg: str) -> str:
         src = (raw_prompt or fallback_user_msg or "").strip()
+        full_src_low = f"{src} {fallback_user_msg or ''}".lower()
+
+        framing_tag = "balanced composition, full scene visibility"
+        if any(k in full_src_low for k in ("corpo inteiro", "full body", "dos pés à cabeça", "dos pes a cabeca")):
+            framing_tag = "full body shot, standing from head to toe, visible feet, full character in frame"
+        elif any(k in full_src_low for k in ("meio corpo", "plano médio", "plano medio", "waist up", "upper body")):
+            framing_tag = "medium shot, waist up, balanced framing with environment"
+
         cleaned = re.sub(
-            r'^(crie|gere|faça|faca|desenhe|mostre)\s+(uma\s+|um\s+)?(imagem|arte|foto|ilustração|ilustracao)\s+(de\s+|do\s+|da\s+)?',
+            r'^(crie|gere|faça|faca|desenhe|mostre)\s+(uma\s+|um\s+|a\s+|o\s+)?(imagem|arte|foto|ilustração|ilustracao)\s+(de\s+|do\s+|da\s+)?',
             '',
             src,
             flags=re.IGNORECASE
         ).strip() or src
 
-        if not re.search(r'[áéíóúâêîôûãõçÁÉÍÓÚÂÊÎÔÛÃÕÇ]', cleaned) and re.search(r'\b(girl|boy|woman|man|warrior|vampire|cyberpunk|neon|city|cat|dragon)\b', cleaned.lower()):
-            return f"{cleaned}, detailed face and subject focus, high detail"
-
         translated = cleaned.lower()
         for pat, rep in _PT_TO_EN_IMAGE_MAP:
             translated = re.sub(pat, rep, translated)
 
-        translated = re.sub(r'\b(em|uma|um|de|do|da|com|e|no|na|para|por|ao|aos)\b', ' ', translated)
+        translated = re.sub(r'\b(em|uma|um|de|do|da|com|e|no|na|para|por|ao|aos|sob)\b', ' ', translated)
         tokens = [t.strip(" ,.") for t in re.split(r'[,\n]+', translated) if t.strip(" ,.")]
 
-        subject_keywords = ("warrior", "vampire", "girl", "boy", "woman", "man", "cat", "dog", "dragon", "character", "personagem")
+        subject_keywords = ("warrior", "vampire", "girl", "boy", "woman", "man", "cat", "dog", "dragon", "character")
         priority = []
         others = []
         for tok in tokens:
@@ -188,13 +195,13 @@ class LucyEngine:
             if not t_clean:
                 continue
             if any(k in t_clean for k in subject_keywords):
-                priority.append(f"{t_clean}, centered subject, detailed character")
+                priority.append(f"{t_clean}, {framing_tag}")
             else:
                 others.append(t_clean)
 
         ordered = priority + others
         if not ordered:
-            ordered = ["detailed subject, dynamic lighting, high quality"]
+            ordered = [f"detailed subject, {framing_tag}"]
         return ", ".join(dict.fromkeys(ordered))
 
     def _fallback_intent_router(self, user_msg: str):
@@ -367,3 +374,4 @@ class LucyEngine:
             if generated_image:
                 self._preload_llm_async()
             yield reply_text, final_image_path, None, "Pronto"
+
